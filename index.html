@@ -5,34 +5,346 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Live Webcam Stream</title>
   <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
+  <style>
+    .container {
+      max-width: 800px;
+      margin: 0 auto;
+      padding: 20px;
+    }
+    video {
+      width: 100%;
+      max-height: 500px;
+      background-color: #000;
+    }
+    .controls {
+      margin-top: 15px;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+    }
+    .status {
+      margin-top: 10px;
+      padding: 8px;
+      background-color: #f0f0f0;
+      border-radius: 4px;
+    }
+    button {
+      padding: 8px 16px;
+      background-color: #4285f4;
+      color: white;
+      border: none;
+      border-radius: 4px;
+      cursor: pointer;
+    }
+    button:hover {
+      background-color: #3367d6;
+    }
+    .audio-controls {
+      margin-top: 10px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .slider-container {
+      display: flex;
+      flex-direction: column;
+      min-width: 200px;
+    }
+    .slider-label {
+      margin-bottom: 5px;
+      font-size: 12px;
+    }
+  </style>
 </head>
 <body>
-
-  <h2>Live Webcam Stream</h2>
-  <video id="video" controls autoplay></video>
+  <div class="container">
+    <h2>Live Webcam Stream</h2>
+    <video id="video" controls autoplay></video>
+    
+    <div class="controls">
+      <button id="refresh">Refresh Stream</button>
+      <button id="jumpToLive">Jump to Live</button>
+      <button id="toggleMute">Mute Audio</button>
+    </div>
+    
+    <div class="audio-controls">
+      <div class="slider-container">
+        <div class="slider-label">Audio Delay (ms): <span id="delayValue">0</span></div>
+        <input type="range" id="audioDelay" min="-2000" max="2000" value="0" step="50">
+      </div>
+    </div>
+    
+    <div id="status" class="status">Connecting to stream...</div>
+  </div>
 
   <script>
-   
-     var video = document.getElementById('video');
-      var videoSrc = "http://localhost:3000/hls/index.m3u8"; // HLS stream URL
-  
+    var video = document.getElementById('video');
+    var statusElement = document.getElementById('status');
+    var refreshBtn = document.getElementById('refresh');
+    var jumpToLiveBtn = document.getElementById('jumpToLive');
+    var toggleMuteBtn = document.getElementById('toggleMute');
+    var audioDelaySlider = document.getElementById('audioDelay');
+    var delayValueDisplay = document.getElementById('delayValue');
+    
+    // Add cache-busting parameter to prevent loading old segments
+    var timestamp = new Date().getTime();
+    var videoSrc = "http://localhost:3000/hls/index.m3u8?_=" + timestamp;
+    var hls = null;
+    var audioContext = null;
+    var audioSource = null;
+    var audioDelay = null;
+    var isAudioProcessed = false;
+    
+    function updateStatus(message) {
+      statusElement.textContent = message;
+    }
+    
+    function setupAudioProcessing() {
+      if (isAudioProcessed) return; // Already set up
+      
+      try {
+        if (window.AudioContext || window.webkitAudioContext) {
+          audioContext = new (window.AudioContext || window.webkitAudioContext)();
+          audioSource = audioContext.createMediaElementSource(video);
+          audioDelay = audioContext.createDelay(2.0); // Max 2 second delay
+          audioDelay.delayTime.value = 0;
+          
+          audioSource.connect(audioDelay);
+          audioDelay.connect(audioContext.destination);
+          
+          isAudioProcessed = true;
+          updateStatus("Audio processing enabled");
+        }
+      } catch (e) {
+        console.error("Failed to set up audio processing:", e);
+        updateStatus("Audio processing failed to initialize");
+      }
+    }
+    
+    // Apply audio delay from slider
+    audioDelaySlider.addEventListener('input', function() {
+      var delayMs = parseFloat(this.value);
+      delayValueDisplay.textContent = delayMs;
+      
+      if (isAudioProcessed && audioDelay) {
+        audioDelay.delayTime.value = delayMs < 0 ? 0 : delayMs / 1000;
+        
+        // If negative delay, we need to delay video instead
+        if (delayMs < 0) {
+          video.currentTime = Math.min(video.currentTime - Math.abs(delayMs)/1000, video.duration);
+        }
+      }
+    });
+    
+    function initializeStream() {
+      // Destroy previous instance if exists
+      if (hls) {
+        hls.destroy();
+      }
+      
+      // Reset audio processing
+      if (isAudioProcessed && audioSource) {
+        try {
+          audioSource.disconnect();
+          audioDelay.disconnect();
+          isAudioProcessed = false;
+        } catch (e) {
+          console.warn("Error cleaning up audio nodes:", e);
+        }
+      }
+      
+      // Create a new timestamp to bust cache
+      timestamp = new Date().getTime();
+      videoSrc = "http://localhost:3000/hls/index.m3u8?_=" + timestamp;
+      
       if (Hls.isSupported()) {
-        var hls = new Hls();
+        hls = new Hls({
+          // Anti-caching and low latency settings
+          maxBufferLength: 1,            // Minimal buffer for lowest latency
+          maxMaxBufferLength: 2,         // Very short max buffer
+          liveSyncDurationCount: 1,      // Stay very close to live edge
+          liveMaxLatencyDurationCount: 2,
+          liveDurationInfinity: true,
+          enableWorker: true,
+          lowLatencyMode: true,
+          highBufferWatchdogPeriod: 1,   // More aggressive buffer monitoring
+          fragLoadingTimeOut: 10000,     // 10 seconds timeout for fragment loading
+          manifestLoadingTimeOut: 5000,  // 5 seconds timeout for manifest loading
+          levelLoadingTimeOut: 5000,     // 5 seconds timeout for level loading
+          fragLoadingMaxRetry: 2,        // Fewer retries, fail faster to reload
+          startLevel: -1,                // Auto-select quality level
+          backBufferLength: 0,           // No back buffer to prevent audio loop
+          xhrSetup: function(xhr) {
+            // Prevent caching of manifest and segments
+            xhr.setRequestHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
+            xhr.setRequestHeader('Pragma', 'no-cache');
+            xhr.setRequestHeader('Expires', '0');
+          }
+        });
+        
         hls.loadSource(videoSrc);
         hls.attachMedia(video);
-        hls.on(Hls.Events.MANIFEST_PARSED, function () {
-          video.play();
+        
+        hls.on(Hls.Events.MANIFEST_PARSED, function() {
+          updateStatus("Stream loaded, starting playback");
+          video.play().catch(function(error) {
+            video.muted = true;
+            video.play().then(function() {
+              updateStatus("Stream playing (muted due to autoplay policy)");
+              toggleMuteBtn.textContent = "Unmute Audio";
+            }).catch(function(e) {
+              updateStatus("Autoplay failed: " + e.message);
+            });
+          });
         });
+        
+        // Handle audio track loaded - important for audio sync
+        hls.on(Hls.Events.AUDIO_TRACK_LOADED, function() {
+          updateStatus("Audio track loaded");
+        });
+        
+        // Handle buffer append - monitor for potential issues
+        hls.on(Hls.Events.BUFFER_APPENDED, function(event, data) {
+          if (data.type === 'audio' && data.timeRanges && 
+              data.timeRanges.audio && data.timeRanges.audio.length > 1) {
+            console.info("Multiple audio ranges:", data.timeRanges.audio);
+          }
+        });
+        
+        // More granular error handling
+        hls.on(Hls.Events.ERROR, function(event, data) {
+          console.warn("HLS error:", data);
+          
+          // For audio specific errors, take action
+          if (data.details === 'bufferAddCodecError' && data.type === 'audio') {
+            updateStatus("Audio codec error, attempting recovery");
+            hls.recoverMediaError();
+          }
+          
+          if (data.fatal) {
+            switch(data.type) {
+              case Hls.ErrorTypes.NETWORK_ERROR:
+                updateStatus("Network error, trying to recover");
+                setTimeout(function() {
+                  hls.startLoad();
+                }, 1000);
+                break;
+              case Hls.ErrorTypes.MEDIA_ERROR:
+                updateStatus("Media error, trying to recover");
+                setTimeout(function() {
+                  hls.recoverMediaError();
+                }, 1000);
+                break;
+              default:
+                updateStatus("Fatal error: " + data.details);
+                console.error("Fatal error:", data);
+                setTimeout(initializeStream, 2000); // Complete restart after fatal error
+                break;
+            }
+          }
+        });
+        
+        // Detect and correct if we're falling behind live edge
+        hls.on(Hls.Events.FRAG_CHANGED, function(event, data) {
+          if (hls.liveSyncPosition && 
+              video.currentTime < hls.liveSyncPosition - 3) {
+            video.currentTime = hls.liveSyncPosition - 0.1;
+            updateStatus("Syncing to live position");
+          }
+        });
+        
       } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+        // For Safari - add cache busting here too
         video.src = videoSrc;
-        video.addEventListener('loadedmetadata', function () {
-          video.play();
+        video.addEventListener('loadedmetadata', function() {
+          updateStatus("Stream loaded, starting playback");
+          video.play().catch(function(error) {
+            video.muted = true;
+            video.play();
+          });
         });
       } else {
-        alert("HLS is not supported in this browser.");
-      } 
-
+        updateStatus("HLS is not supported in this browser");
+      }
+    }
+    
+    // Initialize the stream
+    initializeStream();
+    
+    // Refresh button handler
+    refreshBtn.addEventListener('click', function() {
+      updateStatus("Refreshing stream...");
+      initializeStream();
+    });
+    
+    // Jump to live button handler
+    jumpToLiveBtn.addEventListener('click', function() {
+      if (hls && hls.liveSyncPosition) {
+        video.currentTime = hls.liveSyncPosition;
+        updateStatus("Jumped to live position");
+      } else if (video.duration) {
+        video.currentTime = video.duration - 0.1;
+        updateStatus("Jumped to end of buffer");
+      }
+    });
+    
+    // Toggle mute button handler
+    toggleMuteBtn.addEventListener('click', function() {
+      video.muted = !video.muted;
+      this.textContent = video.muted ? "Unmute Audio" : "Mute Audio";
+      
+      // Try to set up audio processing when unmuting
+      if (!video.muted && !isAudioProcessed) {
+        setupAudioProcessing();
+      }
+    });
+    
+    // Enable audio processing when user interacts
+    video.addEventListener('click', function() {
+      if (!isAudioProcessed) {
+        setupAudioProcessing();
+      }
+    });
+    
+    // Monitor buffering issues
+    video.addEventListener('waiting', function() {
+      updateStatus("Buffering...");
+    });
+    
+    video.addEventListener('playing', function() {
+      if (!isAudioProcessed) {
+        // Try to set up audio processing on play
+        setupAudioProcessing();
+      }
+      updateStatus("Stream playing");
+    });
+    
+    // Listen for audio stalls
+    video.addEventListener('stalled', function() {
+      updateStatus("Stream stalled, attempting recovery");
+      if (hls) {
+        hls.startLoad();
+      }
+    });
+    
+    // Automatically restart on errors
+    video.addEventListener('error', function() {
+      updateStatus("Video error, restarting stream in 2 seconds");
+      setTimeout(initializeStream, 2000);
+    });
+    
+    // Periodically check for audio-video sync issues
+    setInterval(function() {
+      if (video.played.length && !video.paused) {
+        // Force reload if consistently stalled with data
+        if (video.readyState > 2 && video.played.end(0) === video.currentTime && 
+            video.played.start(0) < video.currentTime) {
+          console.warn("Possible audio loop detected, forcing refresh");
+          updateStatus("Detecting possible audio loop, refreshing...");
+          initializeStream();
+        }
+      }
+    }, 10000);
   </script>
-
 </body>
 </html>
